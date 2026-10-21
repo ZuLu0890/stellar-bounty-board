@@ -5,6 +5,7 @@ import axios from "axios";
 import fs from "fs";
 import path from "path";
 import { loadIndexerConfig } from "./indexerConfig.js";
+import { normalizeEvent } from "./eventNormalizer.js";
 let parentPort;
 try {
   // worker_threads parentPort is available when running as a Worker
@@ -45,20 +46,6 @@ async function retryWithBackoff(fn, maxRetries = MAX_RETRIES) {
     }
   }
   throw lastError;
-}
-
-// Event normalization mapping
-function normalizeEvent(event) {
-  // Example: map Soroban event to backend-friendly record
-  // Adjust mapping as contract evolves
-  return {
-    id: event.id,
-    type: event.type, // create, reserve, release, refund
-    bountyId: event.bounty_id,
-    actor: event.actor,
-    timestamp: event.timestamp,
-    raw: event,
-  };
 }
 
 // Save events to file (or replace with DB logic)

@@ -7,8 +7,8 @@ use alloc::string::ToString;
 use alloc::vec::Vec as StdVec;
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Events as _, Ledger},
-    Address, Bytes, BytesN, Env, String, Symbol, TryFromVal,
+    testutils::{Address as _, Events as _, Ledger, MockAuth, MockAuthInvoke},
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, TryFromVal,
 };
 
 // ─── Version Tests ──────────────────────────────────────────────────────
@@ -232,6 +232,401 @@ macro_rules! invalid_transition_test {
             action(&client, bounty_id, maintainer, contributor);
         }
     };
+}
+
+// ─── refund_bounty authorisation (#1248) ────────────────────────────────
+
+/// Creates a bounty, reserves it, and advances the ledger past its deadline so
+/// that a refund is permitted. Returns the bounty id.
+fn create_refundable_bounty(
+    env: &Env,
+    client: &StellarBountyBoardContractClient<'static>,
+    maintainer: &Address,
+    contributor: &Address,
+    token_id: &Address,
+) -> u64 {
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(env, token_id);
+    token_admin.mint(maintainer, &1000);
+
+    let deadline = env.ledger().timestamp() + 1000;
+    let bounty_id = client.create_bounty(
+        maintainer,
+        token_id,
+        &500,
+        &String::from_str(env, "repo"),
+        &1,
+        &String::from_str(env, "title"),
+        &deadline,
+        &0u32,
+        &None,
+    );
+    client.reserve_bounty(&bounty_id, contributor);
+    env.ledger().set_timestamp(deadline + 1);
+    bounty_id
+}
+
+#[test]
+fn test_refund_bounty_correct_caller_is_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, _) = setup_test(&env);
+    let bounty_id = create_refundable_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    client.refund_bounty(&bounty_id, &maintainer);
+
+    let bounty = client.get_bounty(&bounty_id);
+    assert_eq!(bounty.status, BountyStatus::Refunded);
+}
+
+/// The contributor is a legitimate actor in the lifecycle (reserve, submit,
+/// dispute) but must never be able to drain the escrow.
+#[test]
+#[should_panic(expected = "MaintainerMismatch")]
+fn test_refund_bounty_rejects_contributor() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, _) = setup_test(&env);
+    let bounty_id = create_refundable_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    client.refund_bounty(&bounty_id, &contributor);
+}
+
+/// The arbiter resolves disputes but has no custody of a bounty's escrow.
+#[test]
+#[should_panic(expected = "MaintainerMismatch")]
+fn test_refund_bounty_rejects_arbiter() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let bounty_id = create_refundable_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    client.refund_bounty(&bounty_id, &arbiter);
+}
+
+/// The contract admin can pause and configure the contract, but refunds are
+/// scoped to the bounty's maintainer, not to privileged roles.
+#[test]
+#[should_panic(expected = "MaintainerMismatch")]
+fn test_refund_bounty_rejects_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, maintainer, contributor, token_id, _, _) = setup_test(&env);
+    let bounty_id = create_refundable_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    client.refund_bounty(&bounty_id, &admin);
+}
+
+#[test]
+#[should_panic(expected = "MaintainerMismatch")]
+fn test_refund_bounty_rejects_stranger() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, _) = setup_test(&env);
+    let bounty_id = create_refundable_bounty(&env, &client, &maintainer, &contributor, &token_id);
+    let stranger = Address::generate(&env);
+
+    client.refund_bounty(&bounty_id, &stranger);
+}
+
+/// Passing the maintainer's address is not the same as the maintainer signing:
+/// a call with no auth entry at all must fail at `require_auth`.
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_refund_bounty_rejects_unsigned_maintainer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, _) = setup_test(&env);
+    let bounty_id = create_refundable_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    env.mock_auths(&[]);
+    client.refund_bounty(&bounty_id, &maintainer);
+}
+
+/// A signature from a different role must not satisfy the maintainer's
+/// `require_auth` even when the maintainer's address is in the argument list.
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_refund_bounty_rejects_signature_from_another_role() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, _) = setup_test(&env);
+    let bounty_id = create_refundable_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    env.mock_auths(&[MockAuth {
+        address: &contributor,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "refund_bounty",
+            args: (&bounty_id, &maintainer).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.refund_bounty(&bounty_id, &maintainer);
+}
+
+// ─── dispute_bounty boundary conditions (#1259) ─────────────────────────
+
+/// Creates a bounty and drives it to `Submitted` so `dispute_bounty` can be
+/// exercised at its documented entry state. Returns `(bounty_id, deadline)`.
+fn create_submitted_bounty(
+    env: &Env,
+    client: &StellarBountyBoardContractClient<'static>,
+    maintainer: &Address,
+    contributor: &Address,
+    token_id: &Address,
+) -> (u64, u64) {
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(env, token_id);
+    token_admin.mint(maintainer, &1000);
+
+    let deadline = env.ledger().timestamp() + 1000;
+    let bounty_id = client.create_bounty(
+        maintainer,
+        token_id,
+        &500,
+        &String::from_str(env, "repo"),
+        &1,
+        &String::from_str(env, "title"),
+        &deadline,
+        &0u32,
+        &None,
+    );
+    client.reserve_bounty(&bounty_id, contributor);
+    client.submit_bounty(&bounty_id, contributor);
+    (bounty_id, deadline)
+}
+
+#[test]
+fn test_dispute_bounty_at_exactly_the_deadline_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let (bounty_id, deadline) =
+        create_submitted_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    // The documented window is inclusive: `now == deadline` is still valid.
+    env.ledger().set_timestamp(deadline);
+    client.dispute_bounty(&bounty_id, &arbiter);
+
+    // `Env::events().all()` reports the events of the most recent invocation,
+    // so inspect them before calling anything else on the contract.
+    let (topic0, topic1) = latest_event_topics(&env, &client);
+    assert_eq!(topic0, symbol_short!("Bounty"));
+    assert_eq!(topic1, symbol_short!("Dispt"));
+
+    let bounty = client.get_bounty(&bounty_id);
+    assert_eq!(bounty.status, BountyStatus::Disputed);
+    assert_eq!(bounty.dispute_raised_at, deadline);
+}
+
+#[test]
+#[should_panic(expected = "BountyExpired")]
+fn test_dispute_bounty_past_the_deadline_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let (bounty_id, deadline) =
+        create_submitted_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    env.ledger().set_timestamp(deadline + 1);
+    client.dispute_bounty(&bounty_id, &arbiter);
+}
+
+#[test]
+#[should_panic(expected = "BountyNotFound")]
+fn test_dispute_bounty_unknown_id_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, _, _, _, _, arbiter) = setup_test(&env);
+    client.dispute_bounty(&999, &arbiter);
+}
+
+#[test]
+#[should_panic(expected = "MissingContributor")]
+fn test_dispute_bounty_without_contributor_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, _, token_id, _, arbiter) = setup_test(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&maintainer, &1000);
+
+    let bounty_id = client.create_bounty(
+        &maintainer,
+        &token_id,
+        &500,
+        &String::from_str(&env, "repo"),
+        &1,
+        &String::from_str(&env, "title"),
+        &(env.ledger().timestamp() + 1000),
+        &0u32,
+        &None,
+    );
+
+    client.dispute_bounty(&bounty_id, &arbiter);
+}
+
+#[test]
+#[should_panic(expected = "BountyMustBeSubmitted")]
+fn test_dispute_bounty_reserved_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&maintainer, &1000);
+
+    let bounty_id = create_bounty_with_state(
+        &env,
+        &client,
+        maintainer,
+        contributor,
+        token_id,
+        BountyStatus::Reserved,
+        arbiter.clone(),
+    );
+
+    client.dispute_bounty(&bounty_id, &arbiter);
+}
+
+#[test]
+#[should_panic(expected = "BountyMustBeSubmitted")]
+fn test_dispute_bounty_released_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&maintainer, &1000);
+
+    // Released before the deadline: the deadline gate passes, so the status
+    // check is what must reject the call.
+    let bounty_id = create_bounty_with_state(
+        &env,
+        &client,
+        maintainer,
+        contributor,
+        token_id,
+        BountyStatus::Released,
+        arbiter.clone(),
+    );
+
+    client.dispute_bounty(&bounty_id, &arbiter);
+}
+
+#[test]
+#[should_panic(expected = "BountyMustBeSubmitted")]
+fn test_dispute_bounty_twice_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&maintainer, &1000);
+
+    let bounty_id = create_bounty_with_state(
+        &env,
+        &client,
+        maintainer,
+        contributor,
+        token_id,
+        BountyStatus::Disputed,
+        arbiter.clone(),
+    );
+
+    client.dispute_bounty(&bounty_id, &arbiter);
+}
+
+/// Error precedence: the deadline is checked before the status, so a bounty
+/// refunded after its deadline reports `BountyExpired`, not
+/// `BountyMustBeSubmitted`. The README documents this ordering explicitly.
+#[test]
+#[should_panic(expected = "BountyExpired")]
+fn test_dispute_bounty_after_refund_fails_on_deadline_not_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&maintainer, &1000);
+
+    let bounty_id = create_bounty_with_state(
+        &env,
+        &client,
+        maintainer,
+        contributor,
+        token_id,
+        BountyStatus::Refunded,
+        arbiter.clone(),
+    );
+
+    client.dispute_bounty(&bounty_id, &arbiter);
+}
+
+#[test]
+#[should_panic(expected = "ArbiterNotSet")]
+fn test_dispute_bounty_without_configured_arbiter_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let (bounty_id, _) =
+        create_submitted_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    env.as_contract(&client.address, || {
+        env.storage().persistent().remove(&DataKey::Arbiter);
+    });
+
+    client.dispute_bounty(&bounty_id, &arbiter);
+}
+
+#[test]
+#[should_panic(expected = "NotArbiter")]
+fn test_dispute_bounty_with_wrong_arbiter_argument_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, _) = setup_test(&env);
+    let (bounty_id, _) =
+        create_submitted_bounty(&env, &client, &maintainer, &contributor, &token_id);
+    let impostor = Address::generate(&env);
+
+    client.dispute_bounty(&bounty_id, &impostor);
+}
+
+/// The contributor is the only address that can open a dispute. A signature
+/// from the maintainer (the counterparty who benefits from no dispute) must
+/// not be enough.
+#[test]
+#[should_panic(expected = "Error(Auth, InvalidAction)")]
+fn test_dispute_bounty_rejects_signature_from_maintainer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _, maintainer, contributor, token_id, _, arbiter) = setup_test(&env);
+    let (bounty_id, _) =
+        create_submitted_bounty(&env, &client, &maintainer, &contributor, &token_id);
+
+    env.mock_auths(&[MockAuth {
+        address: &maintainer,
+        invoke: &MockAuthInvoke {
+            contract: &client.address,
+            fn_name: "dispute_bounty",
+            args: (&bounty_id, &arbiter).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    client.dispute_bounty(&bounty_id, &arbiter);
 }
 
 // ─── Minimum Bounty Amount Tests ────────────────────────────────────────
