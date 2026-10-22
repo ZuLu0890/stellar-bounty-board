@@ -649,6 +649,127 @@ fn test_submit_bounty_emits_event() {
 }
 
 #[test]
+fn test_get_bounty_emits_queried_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, maintainer, contributor, token_id, _fee_recipient, _arbiter) =
+        setup_test(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&maintainer, &1000);
+
+    let deadline = env.ledger().timestamp() + 1000;
+    let fee_bps = 250u32;
+    let bounty_id = client.create_bounty(
+        &maintainer,
+        &token_id,
+        &500,
+        &String::from_str(&env, "repo"),
+        &7,
+        &String::from_str(&env, "title"),
+        &deadline,
+        &fee_bps,
+        &None,
+    );
+    client.reserve_bounty(&bounty_id, &contributor);
+
+    let returned = client.get_bounty(&bounty_id);
+
+    // `get_bounty` must publish its own event so an indexer can react without
+    // re-reading the contract.
+    let events = env.events().all().filter_by_contract(&client.address);
+    let event = events
+        .events()
+        .last()
+        .expect("get_bounty must publish an event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
+    assert_eq!(
+        soroban_sdk::Symbol::from_val(&env, &body.topics[0]),
+        symbol_short!("Bounty")
+    );
+    assert_eq!(
+        soroban_sdk::Symbol::from_val(&env, &body.topics[1]),
+        symbol_short!("Queried")
+    );
+
+    let payload = BountyQueried::from_val(&env, &body.data);
+    assert_eq!(
+        payload,
+        BountyQueried {
+            bounty_id,
+            maintainer: maintainer.clone(),
+            contributor: Some(contributor.clone()),
+            token: token_id.clone(),
+            amount: 500,
+            issue_number: 7,
+            status: BountyStatus::Reserved,
+            deadline,
+            protocol_fee_bps: fee_bps,
+            dispute_raised_at: 0,
+        }
+    );
+
+    // The payload is the returned projection, so a consumer needs no follow-up
+    // read to learn the state it just observed.
+    assert_eq!(returned.status, payload.status);
+    assert_eq!(returned.deadline, payload.deadline);
+    assert_eq!(returned.amount, payload.amount);
+    assert_eq!(returned.protocol_fee_bps, payload.protocol_fee_bps);
+}
+
+#[test]
+fn test_get_bounty_event_reports_lazy_expiration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, maintainer, _contributor, token_id, _fee_recipient, _arbiter) =
+        setup_test(&env);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+    token_admin.mint(&maintainer, &1000);
+
+    let deadline = env.ledger().timestamp() + 1000;
+    let bounty_id = client.create_bounty(
+        &maintainer,
+        &token_id,
+        &500,
+        &String::from_str(&env, "repo"),
+        &1,
+        &String::from_str(&env, "title"),
+        &deadline,
+        &0u32,
+        &None,
+    );
+
+    env.ledger().set_timestamp(deadline + 1);
+    let returned = client.get_bounty(&bounty_id);
+    assert_eq!(returned.status, BountyStatus::Expired);
+
+    let events = env.events().all().filter_by_contract(&client.address);
+    let event = events
+        .events()
+        .last()
+        .expect("get_bounty must publish an event");
+    let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
+    assert_eq!(
+        soroban_sdk::Symbol::from_val(&env, &body.topics[1]),
+        symbol_short!("Queried")
+    );
+    let payload = BountyQueried::from_val(&env, &body.data);
+    assert_eq!(payload.status, BountyStatus::Expired);
+    assert_eq!(payload.deadline, deadline);
+
+    // The expiration is an observation, not a write: storage still holds the
+    // pre-expiry status so the existing read path stays side-effect free.
+    let stored: Bounty = env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Bounty(bounty_id))
+            .expect("bounty should still be stored")
+    });
+    assert_eq!(stored.status, BountyStatus::Open);
+}
+
+#[test]
 fn test_fees_consistent_across_token_types() {
     let env1 = Env::default();
     env1.mock_all_auths();
