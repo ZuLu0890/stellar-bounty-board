@@ -114,6 +114,22 @@ pub struct BountyCreated {
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BountyCreatedEvent {
+    pub bounty_id: u64,
+    pub maintainer: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub repo: String,
+    pub issue_number: u32,
+    pub title: String,
+    pub deadline: u64,
+    pub protocol_fee_bps: u32,
+    pub dispute_window_override: Option<u64>,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BountyReserved {
     pub bounty_id: u64,
     pub contributor: Address,
@@ -741,7 +757,7 @@ impl StellarBountyBoardContract {
             amount,
             repo: repo.clone(),
             issue_number,
-            title,
+            title: title.clone(),
             deadline,
             status: BountyStatus::Open,
             protocol_fee_bps,
@@ -760,12 +776,29 @@ impl StellarBountyBoardContract {
             (symbol_short!("Bounty"), symbol_short!("Create")),
             BountyCreated {
                 bounty_id: next_id,
+                maintainer: maintainer.clone(),
+                token: token.clone(),
+                amount,
+                repo: repo.clone(),
+                issue_number,
+                protocol_fee_bps,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("Bounty"), symbol_short!("CrtEvent")),
+            BountyCreatedEvent {
+                bounty_id: next_id,
                 maintainer,
                 token,
                 amount,
                 repo,
                 issue_number,
+                title,
+                deadline,
                 protocol_fee_bps,
+                dispute_window_override,
+                created_at: env.ledger().timestamp(),
             },
         );
 

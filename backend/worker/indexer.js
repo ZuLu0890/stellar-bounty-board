@@ -46,6 +46,7 @@ async function retryWithBackoff(fn, maxRetries = MAX_RETRIES) {
 
 const EVENT_TYPES = {
   Create: "create",
+  CrtEvent: "created",
   Reserv: "reserve",
   Submit: "submit",
   Releas: "release",
@@ -141,16 +142,18 @@ export function normalizeEvent(event) {
     normalized.released = true;
   }
 
-  // `get_bounty` is the only read path that applies lazy expiration, so its
-  // event carries the post-expiration projection. Expose that projection whole
-  // (status/deadline included) rather than only the shared scalar fields above:
-  // an indexer can update its record from this event alone.
-  if (type === "queried") {
-    const state = jsonSafeDeep(data);
-    state.status = normalizeStatus(state.status);
-    normalized.status = state.status;
-    normalized.deadline = jsonSafe(state.deadline);
-    normalized.state = state;
+ // `created` is the structured create_bounty event (BountyCreatedEvent).
+  // The payload carries everything the worker needs, so no follow-up
+  // contract read is required.
+  if (type === "created") {
+    normalized.token = addressString(data.token);
+    normalized.repo = data.repo;
+    normalized.issueNumber = jsonSafe(data.issue_number);
+    normalized.title = data.title;
+    normalized.deadline = jsonSafe(data.deadline);
+    normalized.protocolFeeBps = jsonSafe(data.protocol_fee_bps);
+    normalized.disputeWindowOverride = jsonSafe(data.dispute_window_override ?? null);
+    normalized.createdAt = jsonSafe(data.created_at);
   }
 
   return normalized;
