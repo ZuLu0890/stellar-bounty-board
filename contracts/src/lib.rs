@@ -231,6 +231,24 @@ pub struct BountyCanceled {
     pub amount: i128,
 }
 
+/// Emitted by [`get_bounty`] after lazy expiration has been applied.
+/// This allows indexers to observe the `Open/Reserved → Expired` transition
+/// without having to poll every bounty on a timer.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BountyQueried {
+    pub bounty_id: u64,
+    pub maintainer: Address,
+    pub contributor: Option<Address>,
+    pub token: Address,
+    pub amount: i128,
+    pub issue_number: u32,
+    pub status: BountyStatus,
+    pub deadline: u64,
+    pub protocol_fee_bps: u32,
+    pub dispute_raised_at: u64,
+}
+
 /// Emitted when a bounty's deadline is extended.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1294,6 +1312,19 @@ impl StellarBountyBoardContract {
     pub fn get_bounty(env: Env, bounty_id: u64) -> Bounty {
         let mut bounty = read_bounty(&env, bounty_id);
         expire_if_needed(&env, &mut bounty);
+        // Publish BountyQueried event so indexers can observe the lazy expiration
+        env.events().publish((symbol_short!("Bounty"), symbol_short!("Queried")), BountyQueried {
+            bounty_id,  // from get_bounty parameter
+            maintainer: bounty.maintainer.clone(),
+            contributor: bounty.contributor.clone(),
+            token: bounty.token.clone(),
+            amount: bounty.amount,
+            issue_number: bounty.issue_number,
+            status: bounty.status,
+            deadline: bounty.deadline,
+            protocol_fee_bps: bounty.protocol_fee_bps,
+            dispute_raised_at: bounty.dispute_raised_at,
+        });
         bounty
     }
 
