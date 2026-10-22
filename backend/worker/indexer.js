@@ -49,13 +49,21 @@ const EVENT_TYPES = {
   Reserv: "reserve",
   Submit: "submit",
   Releas: "release",
+  RelEvent: "release",
   Refund: "refund",
   Dispt: "disputed",
+  Queried: "queried",
 };
 
 function decodeScVal(value) {
   if (typeof value !== "string") return value;
-  return scValToNative(xdr.ScVal.fromXDR(value, "base64"));
+  try {
+    return scValToNative(xdr.ScVal.fromXDR(value, "base64"));
+  } catch {
+    // A value that is not valid XDR stays as-is: one malformed event should
+    // not stop the whole poll from being indexed.
+    return value;
+  }
 }
 
 function eventData(value) {
@@ -68,6 +76,24 @@ function eventData(value) {
 
 function jsonSafe(value) {
   return typeof value === "bigint" ? value.toString() : value;
+}
+
+// `jsonSafe` only handles top-level fields; the queried state is a whole struct
+// whose u64/i128 fields decode to BigInt, which JSON.stringify cannot serialise.
+function jsonSafeDeep(value) {
+  if (typeof value === "bigint") return value.toString();
+  if (Array.isArray(value)) return value.map(jsonSafeDeep);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, jsonSafeDeep(entry)]));
+  }
+  return value;
+}
+
+// A contract enum unit variant is encoded as a one-element vector, so
+// `scValToNative` yields ["Expired"] rather than "Expired".
+function normalizeStatus(status) {
+  if (Array.isArray(status) && status.length === 1) return status[0];
+  return status;
 }
 
 function addressString(value) {
@@ -113,6 +139,18 @@ export function normalizeEvent(event) {
   // carries these fields (BountyReleased), so this is just a convenience view.
   if (type === " release".trim()) {
     normalized.released = true;
+  }
+
+  // `get_bounty` is the only read path that applies lazy expiration, so its
+  // event carries the post-expiration projection. Expose that projection whole
+  // (status/deadline included) rather than only the shared scalar fields above:
+  // an indexer can update its record from this event alone.
+  if (type === "queried") {
+    const state = jsonSafeDeep(data);
+    state.status = normalizeStatus(state.status);
+    normalized.status = state.status;
+    normalized.deadline = jsonSafe(state.deadline);
+    normalized.state = state;
   }
 
   return normalized;

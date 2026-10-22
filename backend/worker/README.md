@@ -23,6 +23,7 @@ stable event type string:
 | `Releas`   | `release`      | `BountyReleased`   | bounty ID, contributor, maintainer, amount           |
 | `Refund`   | `refunde`      | `BountyRefunded`   | bounty ID, maintainer, amount                      |
 | `Dispt`    | `disputed`     | `BountyDisputed`    | bounty ID, contributor, arbiter                      |
+| `Queried`  | `queried`      | `BountyQueried`     | bounty ID, status, deadline, full mutable state      |
 
 ### Release event
 
@@ -32,6 +33,19 @@ The worker normalizes this into a record with `type: "release"`, the bounty ID, 
 contributor, the maintainer, and the released amount -- all derived from the event
 payload alone. No follow-up contract read is required to react to the release
 transition.
+
+## Queried event
+
+`get_bounty` is the only read path that applies lazy expiration: an `Open` or
+`Reserved` bounty past its deadline is returned as `Expired` without being
+written back to storage. The contract publishes `(Bounty, Queried)` with a
+`BountyQueried` payload carrying the post-expiration projection.
+
+The worker normalizes it into `type: "queried"` and copies `status`, `deadline`
+and the whole projection (`state`) onto the record, with the unit-variant status
+flattened (`["Expired"]` -> `"Expired"`) and `BigInt` fields made JSON-safe. An
+indexer can therefore move a bounty to `Expired` from the event alone - no scan
+of every bounty and no follow-up contract read.
 
 ## Usage
 
